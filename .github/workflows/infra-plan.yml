@@ -1,0 +1,127 @@
+name: Infrastructure Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/infra-plan.yml'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.8.0'
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, stage, prod]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: terraform-plan-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Setup Checkov
+        run: |
+          pip install checkov
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          cd infra/terraform
+          terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd infra/terraform
+          terraform init -backend-config="key=obvy-imggen/${{ matrix.environment }}/terraform.tfstate"
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          cd infra/terraform
+          terraform validate
+
+      - name: TFLint
+        id: tflint
+        run: |
+          cd infra/terraform
+          tflint --init
+          tflint --recursive
+        continue-on-error: true
+
+      - name: Checkov Security Scan
+        id: checkov
+        run: |
+          checkov -d infra/terraform --framework terraform --output cli --quiet
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd infra/terraform
+          terraform workspace select ${{ matrix.environment }} || terraform workspace new ${{ matrix.environment }}
+          terraform plan -var-file="environments/${{ matrix.environment }}.tfvars" -out="${{ matrix.environment }}.tfplan" -no-color
+        continue-on-error: true
+
+      - name: Update Pull Request
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### TFLint 🔍\`${{ steps.tflint.outcome }}\`
+            #### Checkov Security Scan 🛡️\`${{ steps.checkov.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan (${{ matrix.environment }})</summary>
+            
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
